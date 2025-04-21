@@ -1,0 +1,2353 @@
+#Créditos; David Ruiz (a.k.a @viajatech) si usas mi script favor de darle like a este repositorio en;https://github.com/viajatech/HoteleroPlus
+
+#pip install PyQt5 reportlab qrcode bcrypt PyPDF2 openpyxl pandas matplotlib requests pillow python-docx
+#pip install pandas
+#pip install reportlab
+#pip install openpyxl
+#pip install pillow
+
+
+import sys
+import os
+from PyQt5 import QtWidgets, QtGui, QtCore
+import sqlite3
+import bcrypt
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter, landscape
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import requests
+import datetime
+from datetime import timedelta
+import calendar
+from PIL import Image, ImageDraw
+from docx import Document
+from docx.shared import Inches
+import pickle
+import qrcode
+
+
+class HoteleroApp(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Hotelero by Viaja Tech")
+        self.setGeometry(100, 100, 1200, 800)
+
+        # Conectar a la base de datos
+        self.conn = sqlite3.connect('hotelero.db')
+        self.cursor = self.conn.cursor()
+        self.create_tables()
+
+        self.current_user_role = None  # Rol del usuario actual
+        self.current_user_name = None  # Nombre de usuario actual
+
+        # Variables para el sistema de horarios
+        self.trabajadores = []
+        self.horarios = {}
+        self.dias_descanso = {}
+        self.horas_semanales = {}
+        self.anio_actual = datetime.datetime.now().year
+
+        self.initUI()
+
+    def initUI(self):
+        self.login_screen()
+
+    def create_tables(self):
+        # Crear tablas necesarias en la base de datos
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS employees (
+                employee_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                username TEXT UNIQUE,
+                password BLOB,
+                role TEXT
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                employee_id INTEGER,
+                login_time TEXT,
+                FOREIGN KEY(employee_id) REFERENCES employees(employee_id)
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rooms (
+                room_number INTEGER PRIMARY KEY,
+                room_type TEXT,
+                status TEXT,
+                is_vip BOOLEAN
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS guests (
+                guest_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                phone TEXT,
+                email TEXT,
+                status TEXT,
+                extra_charges REAL,
+                num_occupants INTEGER,
+                qr_code TEXT
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS reservations (
+                reservation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guest_id INTEGER,
+                room_number INTEGER,
+                check_in_date TEXT,
+                check_out_date TEXT,
+                num_nights INTEGER,
+                price_per_night REAL,
+                total_cost REAL,
+                status TEXT,
+                notes TEXT,
+                FOREIGN KEY(guest_id) REFERENCES guests(guest_id),
+                FOREIGN KEY(room_number) REFERENCES rooms(room_number)
+            )
+        ''')
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS suppliers (
+                supplier_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT,
+                contact TEXT,
+                amount_due REAL,
+                debt_date TEXT
+            )
+        ''')
+        # Nueva tabla para horarios laborales
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS employee_schedules (
+                schedule_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                employee_id INTEGER,
+                date TEXT,
+                start_time TEXT,
+                end_time TEXT,
+                extra_hours TEXT,
+                FOREIGN KEY(employee_id) REFERENCES employees(employee_id)
+            )
+        ''')
+        # Nueva tabla para días de descanso
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rest_days (
+                rest_day_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                employee_id INTEGER,
+                day_of_week TEXT,
+                FOREIGN KEY(employee_id) REFERENCES employees(employee_id)
+            )
+        ''')
+        self.conn.commit()
+
+    def login_screen(self):
+        # Pantalla de inicio de sesión
+        self.login_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+
+        title = QtWidgets.QLabel("Bienvenido a Hotelero by Viaja Tech")
+        title.setAlignment(QtCore.Qt.AlignCenter)
+        title.setFont(QtGui.QFont("Arial", 24))
+
+        form_layout = QtWidgets.QFormLayout()
+        self.username_input = QtWidgets.QLineEdit()
+        self.password_input = QtWidgets.QLineEdit()
+        self.password_input.setEchoMode(QtWidgets.QLineEdit.Password)
+
+        form_layout.addRow("Usuario:", self.username_input)
+        form_layout.addRow("Contraseña:", self.password_input)
+
+        self.login_button = QtWidgets.QPushButton("Iniciar Sesión")
+        self.login_button.clicked.connect(self.login)
+
+        self.register_button = QtWidgets.QPushButton("Registrar Empleado")
+        self.register_button.clicked.connect(self.register_employee)
+
+        layout.addWidget(title)
+        layout.addLayout(form_layout)
+        layout.addWidget(self.login_button)
+        layout.addWidget(self.register_button)
+
+        self.login_widget.setLayout(layout)
+        self.setCentralWidget(self.login_widget)
+
+    def login(self):
+        username = self.username_input.text()
+        password = self.password_input.text()
+
+        if not all([username, password]):
+            QtWidgets.QMessageBox.warning(self, "Error", "Por favor, ingresa usuario y contraseña.")
+            return
+
+        try:
+            self.cursor.execute('SELECT employee_id, password, role, name FROM employees WHERE username = ?', (username,))
+            result = self.cursor.fetchone()
+
+            if result:
+                employee_id, stored_password, role, name = result
+
+                # Asegurarse de que stored_password es de tipo bytes
+                if isinstance(stored_password, memoryview):
+                    stored_password = stored_password.tobytes()
+
+                if bcrypt.checkpw(password.encode('utf-8'), stored_password):
+                    self.current_user_role = role
+                    self.current_user_name = name
+                    QtWidgets.QMessageBox.information(self, "Éxito", f"¡Bienvenido {name}!")
+                    # Registrar sesión
+                    login_time = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    self.cursor.execute('''
+                        INSERT INTO sessions (employee_id, login_time) VALUES (?, ?)
+                    ''', (employee_id, login_time))
+                    self.conn.commit()
+                    self.main_menu()
+                else:
+                    QtWidgets.QMessageBox.warning(self, "Error", "Usuario o contraseña incorrectos.")
+            else:
+                QtWidgets.QMessageBox.warning(self, "Error", "Usuario o contraseña incorrectos.")
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Ocurrió un error: {str(e)}")
+            print(f"Error en login: {e}")
+
+    def register_employee(self):
+        # Ventana de registro de nuevo empleado
+        self.register_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+
+        form_layout = QtWidgets.QFormLayout()
+        self.reg_name_input = QtWidgets.QLineEdit()
+        self.reg_username_input = QtWidgets.QLineEdit()
+        self.reg_password_input = QtWidgets.QLineEdit()
+        self.reg_password_input.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.reg_role_input = QtWidgets.QComboBox()
+        self.reg_role_input.addItems(["Administrador", "Recepcionista", "Gerente", "Becario"])
+
+        form_layout.addRow("Nombre:", self.reg_name_input)
+        form_layout.addRow("Usuario:", self.reg_username_input)
+        form_layout.addRow("Contraseña:", self.reg_password_input)
+        form_layout.addRow("Rol:", self.reg_role_input)
+
+        self.create_employee_button = QtWidgets.QPushButton("Crear Empleado")
+        self.create_employee_button.clicked.connect(self.create_employee)
+
+        layout.addLayout(form_layout)
+        layout.addWidget(self.create_employee_button)
+
+        self.register_widget.setLayout(layout)
+        self.register_widget.setWindowTitle("Registrar Nuevo Empleado")
+        self.register_widget.setGeometry(200, 200, 400, 300)
+        self.register_widget.show()
+
+    def create_employee(self):
+        name = self.reg_name_input.text()
+        username = self.reg_username_input.text()
+        password = self.reg_password_input.text()
+        role = self.reg_role_input.currentText()
+
+        if not all([name, username, password]):
+            QtWidgets.QMessageBox.warning(self, "Error", "Por favor, completa todos los campos.")
+            return
+
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+
+        try:
+            self.cursor.execute('''
+                INSERT INTO employees (name, username, password, role) VALUES (?, ?, ?, ?)
+            ''', (name, username, hashed_password, role))
+            self.conn.commit()
+            QtWidgets.QMessageBox.information(self, "Éxito", "Empleado registrado exitosamente.")
+            self.register_widget.close()
+        except sqlite3.IntegrityError:
+            QtWidgets.QMessageBox.warning(self, "Error", "El nombre de usuario ya existe.")
+
+    def main_menu(self):
+        try:
+            # Menú principal después de iniciar sesión
+            self.main_widget = QtWidgets.QWidget()
+            layout = QtWidgets.QVBoxLayout()
+
+            self.tabs = QtWidgets.QTabWidget()
+            layout.addWidget(self.tabs)
+
+            if self.current_user_role in ["Administrador", "Gerente"]:
+                self.employee_management_tab()
+                self.supplier_management_tab()
+
+            self.room_management_tab()
+            self.reservation_management_tab()
+            self.guest_management_tab()
+            self.reports_tab()
+            
+            # Agregar la nueva pestaña de horarios laborales
+            self.horarios_laborales_tab()
+
+            self.main_widget.setLayout(layout)
+            self.setCentralWidget(self.main_widget)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Ocurrió un error en el menú principal: {str(e)}")
+            print(f"Error en main_menu: {e}")
+
+    def employee_management_tab(self):
+        # Pestaña de gestión de empleados
+        self.employees_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.employees_tab, "Empleados")
+
+        layout = QtWidgets.QVBoxLayout()
+        self.employees_table = QtWidgets.QTableWidget()
+        self.employees_table.setColumnCount(5)
+        self.employees_table.setHorizontalHeaderLabels(['ID', 'Nombre', 'Usuario', 'Rol', 'Último Inicio de Sesión'])
+        self.load_employees_data()
+
+        layout.addWidget(self.employees_table)
+        self.employees_tab.setLayout(layout)
+
+    def load_employees_data(self):
+        self.cursor.execute('''
+            SELECT e.employee_id, e.name, e.username, e.role, MAX(s.login_time)
+            FROM employees e
+            LEFT JOIN sessions s ON e.employee_id = s.employee_id
+            GROUP BY e.employee_id
+        ''')
+        employees = self.cursor.fetchall()
+        self.employees_table.setRowCount(0)
+        for row_number, row_data in enumerate(employees):
+            self.employees_table.insertRow(row_number)
+            for column_number, data in enumerate(row_data):
+                if data is None:
+                    data = ''
+                self.employees_table.setItem(row_number, column_number, QtWidgets.QTableWidgetItem(str(data)))
+
+    def supplier_management_tab(self):
+        # Pestaña de gestión de proveedores
+        self.suppliers_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.suppliers_tab, "Proveedores")
+
+        layout = QtWidgets.QVBoxLayout()
+        self.suppliers_table = QtWidgets.QTableWidget()
+        self.suppliers_table.setColumnCount(6)
+        self.suppliers_table.setHorizontalHeaderLabels(['ID', 'Nombre', 'Contacto', 'Deuda', 'Fecha', 'Acciones'])
+        self.load_suppliers_data()
+
+        self.add_supplier_button = QtWidgets.QPushButton("Agregar Proveedor")
+        self.add_supplier_button.clicked.connect(self.add_supplier)
+
+        layout.addWidget(self.suppliers_table)
+        layout.addWidget(self.add_supplier_button)
+        self.suppliers_tab.setLayout(layout)
+
+    def load_suppliers_data(self):
+        self.cursor.execute('SELECT supplier_id, name, contact, amount_due, debt_date FROM suppliers')
+        suppliers = self.cursor.fetchall()
+        self.suppliers_table.setRowCount(0)
+        for row_number, row_data in enumerate(suppliers):
+            self.suppliers_table.insertRow(row_number)
+            for column_number, data in enumerate(row_data):
+                self.suppliers_table.setItem(row_number, column_number, QtWidgets.QTableWidgetItem(str(data)))
+            # Botón de acciones
+            action_layout = QtWidgets.QHBoxLayout()
+            edit_button = QtWidgets.QPushButton("Editar")
+            edit_button.clicked.connect(lambda checked, sid=row_data[0]: self.edit_supplier(sid))
+            delete_button = QtWidgets.QPushButton("Eliminar")
+            delete_button.clicked.connect(lambda checked, sid=row_data[0]: self.delete_supplier(sid))
+            action_widget = QtWidgets.QWidget()
+            action_layout.addWidget(edit_button)
+            action_layout.addWidget(delete_button)
+            action_widget.setLayout(action_layout)
+            self.suppliers_table.setCellWidget(row_number, 5, action_widget)
+
+    def add_supplier(self):
+        # Ventana para agregar un nuevo proveedor
+        self.add_supplier_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+
+        form_layout = QtWidgets.QFormLayout()
+        self.supplier_name_input = QtWidgets.QLineEdit()
+        self.supplier_contact_input = QtWidgets.QLineEdit()
+        self.supplier_amount_input = QtWidgets.QLineEdit()
+        self.supplier_date_input = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
+
+        form_layout.addRow("Nombre del Proveedor:", self.supplier_name_input)
+        form_layout.addRow("Contacto:", self.supplier_contact_input)
+        form_layout.addRow("Deuda Pendiente:", self.supplier_amount_input)
+        form_layout.addRow("Fecha de Deuda:", self.supplier_date_input)
+
+        self.create_supplier_button = QtWidgets.QPushButton("Crear Proveedor")
+        self.create_supplier_button.clicked.connect(self.create_supplier)
+
+        layout.addLayout(form_layout)
+        layout.addWidget(self.create_supplier_button)
+
+        self.add_supplier_widget.setLayout(layout)
+        self.add_supplier_widget.setWindowTitle("Agregar Nuevo Proveedor")
+        self.add_supplier_widget.setGeometry(200, 200, 400, 300)
+        self.add_supplier_widget.show()
+
+    def create_supplier(self):
+        name = self.supplier_name_input.text()
+        contact = self.supplier_contact_input.text()
+        amount_due = self.supplier_amount_input.text()
+        debt_date = self.supplier_date_input.date().toString('yyyy-MM-dd')
+
+        if not name:
+            QtWidgets.QMessageBox.warning(self, "Error", "Por favor, ingresa el nombre del proveedor.")
+            return
+
+        try:
+            amount_due = float(amount_due) if amount_due else 0.0
+        except ValueError:
+            QtWidgets.QMessageBox.warning(self, "Error", "La deuda debe ser un número.")
+            return
+
+        self.cursor.execute('''
+            INSERT INTO suppliers (name, contact, amount_due, debt_date) VALUES (?, ?, ?, ?)
+        ''', (name, contact, amount_due, debt_date))
+        self.conn.commit()
+        QtWidgets.QMessageBox.information(self, "Éxito", "Proveedor creado exitosamente.")
+        self.add_supplier_widget.close()
+        self.load_suppliers_data()
+
+    def edit_supplier(self, supplier_id):
+        # Función para editar un proveedor existente
+        self.edit_supplier_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+
+        form_layout = QtWidgets.QFormLayout()
+
+        self.cursor.execute('SELECT name, contact, amount_due, debt_date FROM suppliers WHERE supplier_id = ?', (supplier_id,))
+        supplier_data = self.cursor.fetchone()
+        if supplier_data:
+            name, contact, amount_due, debt_date = supplier_data
+
+        self.edit_supplier_name_input = QtWidgets.QLineEdit(name)
+        self.edit_supplier_contact_input = QtWidgets.QLineEdit(contact)
+        self.edit_supplier_amount_input = QtWidgets.QLineEdit(str(amount_due))
+        self.edit_supplier_date_input = QtWidgets.QDateEdit(QtCore.QDate.fromString(debt_date, 'yyyy-MM-dd'))
+
+        form_layout.addRow("Nombre del Proveedor:", self.edit_supplier_name_input)
+        form_layout.addRow("Contacto:", self.edit_supplier_contact_input)
+        form_layout.addRow("Deuda Pendiente:", self.edit_supplier_amount_input)
+        form_layout.addRow("Fecha de Deuda:", self.edit_supplier_date_input)
+
+        self.update_supplier_button = QtWidgets.QPushButton("Actualizar Proveedor")
+        self.update_supplier_button.clicked.connect(lambda: self.update_supplier(supplier_id))
+
+        layout.addLayout(form_layout)
+        layout.addWidget(self.update_supplier_button)
+
+        self.edit_supplier_widget.setLayout(layout)
+        self.edit_supplier_widget.setWindowTitle("Editar Proveedor")
+        self.edit_supplier_widget.setGeometry(200, 200, 400, 300)
+        self.edit_supplier_widget.show()
+
+    def update_supplier(self, supplier_id):
+        name = self.edit_supplier_name_input.text()
+        contact = self.edit_supplier_contact_input.text()
+        amount_due = self.edit_supplier_amount_input.text()
+        debt_date = self.edit_supplier_date_input.date().toString('yyyy-MM-dd')
+
+        if not name:
+            QtWidgets.QMessageBox.warning(self, "Error", "Por favor, ingresa el nombre del proveedor.")
+            return
+
+        try:
+            amount_due = float(amount_due) if amount_due else 0.0
+        except ValueError:
+            QtWidgets.QMessageBox.warning(self, "Error", "La deuda debe ser un número.")
+            return
+
+        self.cursor.execute('''
+            UPDATE suppliers SET name = ?, contact = ?, amount_due = ?, debt_date = ? WHERE supplier_id = ?
+        ''', (name, contact, amount_due, debt_date, supplier_id))
+        self.conn.commit()
+        QtWidgets.QMessageBox.information(self, "Éxito", "Proveedor actualizado exitosamente.")
+        self.edit_supplier_widget.close()
+        self.load_suppliers_data()
+
+    def delete_supplier(self, supplier_id):
+        reply = QtWidgets.QMessageBox.question(self, 'Eliminar Proveedor',
+                                               '¿Estás seguro de que deseas eliminar este proveedor?',
+                                               QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+        if reply == QtWidgets.QMessageBox.Yes:
+            self.cursor.execute('DELETE FROM suppliers WHERE supplier_id = ?', (supplier_id,))
+            self.conn.commit()
+            QtWidgets.QMessageBox.information(self, "Éxito", "Proveedor eliminado exitosamente.")
+            self.load_suppliers_data()
+
+    def room_management_tab(self):
+        # Pestaña de gestión de habitaciones
+        self.rooms_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.rooms_tab, "Habitaciones")
+
+        layout = QtWidgets.QVBoxLayout()
+        self.rooms_graphics_view = QtWidgets.QGraphicsView()
+        self.rooms_scene = QtWidgets.QGraphicsScene()
+        self.rooms_graphics_view.setScene(self.rooms_scene)
+        self.draw_rooms()
+
+        self.add_room_button = QtWidgets.QPushButton("Agregar Habitación")
+        self.add_room_button.clicked.connect(self.add_room)
+
+        layout.addWidget(self.rooms_graphics_view)
+        layout.addWidget(self.add_room_button)
+        self.rooms_tab.setLayout(layout)
+
+    def draw_rooms(self):
+        self.rooms_scene.clear()
+        self.cursor.execute('SELECT room_number, status FROM rooms')
+        rooms = self.cursor.fetchall()
+        x = 0
+        y = 0
+        for i, (room_number, status) in enumerate(rooms):
+            rect = QtWidgets.QGraphicsRectItem(x, y, 100, 100)
+            color = QtGui.QColor('green')  # Disponible
+            if status == 'Ocupado':
+                color = QtGui.QColor('yellow')
+            elif status == 'En Mantenimiento':
+                color = QtGui.QColor('orange')
+            elif status == 'No Disponible':
+                color = QtGui.QColor('red')
+            elif status == 'Reservado':
+                color = QtGui.QColor('blue')
+            rect.setBrush(QtGui.QBrush(color))
+            text = QtWidgets.QGraphicsTextItem(str(room_number), rect)
+            text.setDefaultTextColor(QtGui.QColor('black'))
+            text.setPos(x + 35, y + 40)
+            self.rooms_scene.addItem(rect)
+            x += 110
+            if x >= 1100:
+                x = 0
+                y += 110
+
+    def add_room(self):
+        # Ventana para agregar una nueva habitación
+        self.add_room_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+
+        form_layout = QtWidgets.QFormLayout()
+        self.room_number_input = QtWidgets.QLineEdit()
+        self.room_type_input = QtWidgets.QComboBox()
+        self.room_type_input.addItems(["Estándar", "Suite", "Deluxe"])
+        self.room_status_input = QtWidgets.QComboBox()
+        self.room_status_input.addItems(["Disponible", "Ocupado", "En Mantenimiento", "No Disponible", "Reservado"])
+        self.room_vip_input = QtWidgets.QCheckBox("Es VIP")
+
+        form_layout.addRow("Número de Habitación:", self.room_number_input)
+        form_layout.addRow("Tipo de Habitación:", self.room_type_input)
+        form_layout.addRow("Estado de Habitación:", self.room_status_input)
+        form_layout.addRow("", self.room_vip_input)
+
+        self.create_room_button = QtWidgets.QPushButton("Crear Habitación")
+        self.create_room_button.clicked.connect(self.create_room)
+
+        layout.addLayout(form_layout)
+        layout.addWidget(self.create_room_button)
+
+        self.add_room_widget.setLayout(layout)
+        self.add_room_widget.setWindowTitle("Agregar Nueva Habitación")
+        self.add_room_widget.setGeometry(200, 200, 400, 300)
+        self.add_room_widget.show()
+
+    def create_room(self):
+        room_number = self.room_number_input.text()
+        room_type = self.room_type_input.currentText()
+        status = self.room_status_input.currentText()
+        is_vip = self.room_vip_input.isChecked()
+
+        if not room_number:
+            QtWidgets.QMessageBox.warning(self, "Error", "Por favor, ingresa el número de habitación.")
+            return
+
+        try:
+            self.cursor.execute('''
+                INSERT INTO rooms (room_number, room_type, status, is_vip) VALUES (?, ?, ?, ?)
+            ''', (room_number, room_type, status, is_vip))
+            self.conn.commit()
+            QtWidgets.QMessageBox.information(self, "Éxito", "Habitación creada exitosamente.")
+            self.add_room_widget.close()
+            self.draw_rooms()
+        except sqlite3.IntegrityError:
+            QtWidgets.QMessageBox.warning(self, "Error", "El número de habitación ya existe.")
+
+    def reservation_management_tab(self):
+        # Pestaña de gestión de reservas
+        self.reservations_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.reservations_tab, "Reservas")
+
+        layout = QtWidgets.QVBoxLayout()
+        self.reservations_table = QtWidgets.QTableWidget()
+        self.reservations_table.setColumnCount(9)
+        self.reservations_table.setHorizontalHeaderLabels(['ID', 'Huésped', 'Habitación', 'Check-In', 'Check-Out', 'Estado', 'Total', 'Ocupantes', 'Acciones'])
+        self.load_reservations_data()
+
+        self.add_reservation_button = QtWidgets.QPushButton("Agregar Reserva")
+        self.add_reservation_button.clicked.connect(self.add_reservation)
+
+        layout.addWidget(self.reservations_table)
+        layout.addWidget(self.add_reservation_button)
+        self.reservations_tab.setLayout(layout)
+
+    def load_reservations_data(self):
+        self.cursor.execute('''
+            SELECT reservations.reservation_id, guests.name, reservations.room_number,
+            reservations.check_in_date, reservations.check_out_date, reservations.status,
+            reservations.total_cost, guests.num_occupants
+            FROM reservations
+            JOIN guests ON reservations.guest_id = guests.guest_id
+        ''')
+        reservations = self.cursor.fetchall()
+        self.reservations_table.setRowCount(0)
+        for row_number, row_data in enumerate(reservations):
+            self.reservations_table.insertRow(row_number)
+            for column_number, data in enumerate(row_data):
+                self.reservations_table.setItem(row_number, column_number, QtWidgets.QTableWidgetItem(str(data)))
+            # Botón de acciones
+            action_layout = QtWidgets.QHBoxLayout()
+            edit_button = QtWidgets.QPushButton("Editar")
+            edit_button.clicked.connect(lambda checked, rid=row_data[0]: self.edit_reservation(rid))
+            delete_button = QtWidgets.QPushButton("Eliminar")
+            delete_button.clicked.connect(lambda checked, rid=row_data[0]: self.delete_reservation(rid))
+            action_widget = QtWidgets.QWidget()
+            action_layout.addWidget(edit_button)
+            action_layout.addWidget(delete_button)
+            action_widget.setLayout(action_layout)
+            self.reservations_table.setCellWidget(row_number, 8, action_widget)
+
+    def add_reservation(self):
+        # Ventana para agregar una nueva reserva
+        self.add_reservation_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+
+        form_layout = QtWidgets.QFormLayout()
+        self.guest_name_input = QtWidgets.QLineEdit()
+        self.guest_phone_input = QtWidgets.QLineEdit()
+        self.guest_email_input = QtWidgets.QLineEdit()
+        self.num_occupants_input = QtWidgets.QSpinBox()
+        self.num_occupants_input.setMinimum(1)
+        self.room_number_input = QtWidgets.QComboBox()
+        self.load_available_rooms()
+        self.check_in_date_input = QtWidgets.QDateEdit(QtCore.QDate.currentDate())
+        self.check_out_date_input = QtWidgets.QDateEdit(QtCore.QDate.currentDate().addDays(1))
+        self.price_per_night_input = QtWidgets.QLineEdit()
+        self.notes_input = QtWidgets.QTextEdit()
+
+        form_layout.addRow("Nombre del Huésped:", self.guest_name_input)
+        form_layout.addRow("Teléfono del Huésped:", self.guest_phone_input)
+        form_layout.addRow("Email del Huésped:", self.guest_email_input)
+        form_layout.addRow("Número de Ocupantes:", self.num_occupants_input)
+        form_layout.addRow("Número de Habitación:", self.room_number_input)
+        form_layout.addRow("Fecha de Check-In:", self.check_in_date_input)
+        form_layout.addRow("Fecha de Check-Out:", self.check_out_date_input)
+        form_layout.addRow("Tarifa por Noche:", self.price_per_night_input)
+        form_layout.addRow("Notas:", self.notes_input)
+
+        self.create_reservation_button = QtWidgets.QPushButton("Crear Reserva")
+        self.create_reservation_button.clicked.connect(self.create_reservation)
+
+        layout.addLayout(form_layout)
+        layout.addWidget(self.create_reservation_button)
+
+        self.add_reservation_widget.setLayout(layout)
+        self.add_reservation_widget.setWindowTitle("Agregar Nueva Reserva")
+        self.add_reservation_widget.setGeometry(200, 200, 400, 600)
+        self.add_reservation_widget.show()
+
+    def load_available_rooms(self):
+        self.room_number_input.clear()
+        self.cursor.execute('SELECT room_number FROM rooms WHERE status = "Disponible" OR status = "Reservado"')
+        rooms = self.cursor.fetchall()
+        for room in rooms:
+            self.room_number_input.addItem(str(room[0]))
+
+    def create_reservation(self):
+        guest_name = self.guest_name_input.text()
+        guest_phone = self.guest_phone_input.text()
+        guest_email = self.guest_email_input.text()
+        num_occupants = self.num_occupants_input.value()
+        room_number = self.room_number_input.currentText()
+        check_in_date = self.check_in_date_input.date().toString('yyyy-MM-dd')
+        check_out_date = self.check_out_date_input.date().toString('yyyy-MM-dd')
+        price_per_night = self.price_per_night_input.text()
+        notes = self.notes_input.toPlainText()
+
+        if not guest_name and not guest_phone and not guest_email:
+            QtWidgets.QMessageBox.warning(self, "Error", "Por favor, ingresa al menos un dato del huésped.")
+            return
+
+        try:
+            price_per_night = float(price_per_night)
+        except ValueError:
+            QtWidgets.QMessageBox.warning(self, "Error", "La tarifa por noche debe ser un número.")
+            return
+
+        # Calcular número de noches
+        check_in = datetime.datetime.strptime(check_in_date, '%Y-%m-%d')
+        check_out = datetime.datetime.strptime(check_out_date, '%Y-%m-%d')
+        num_nights = (check_out - check_in).days
+        if num_nights <= 0:
+            QtWidgets.QMessageBox.warning(self, "Error", "La fecha de check-out debe ser posterior a la de check-in.")
+            return
+
+        total_cost = num_nights * price_per_night
+
+        # Insertar huésped
+        self.cursor.execute('''
+            INSERT INTO guests (name, phone, email, status, extra_charges, num_occupants) VALUES (?, ?, ?, ?, ?, ?)
+        ''', (guest_name, guest_phone, guest_email, 'Normal', 0.0, num_occupants))
+        guest_id = self.cursor.lastrowid
+
+        # Insertar reserva
+        self.cursor.execute('''
+            INSERT INTO reservations (guest_id, room_number, check_in_date, check_out_date, num_nights, price_per_night, total_cost, status, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (guest_id, room_number, check_in_date, check_out_date, num_nights, price_per_night, total_cost, 'Reservado', notes))
+        self.conn.commit()
+
+        # Actualizar estado de la habitación
+        self.cursor.execute('''
+            UPDATE rooms SET status = "Reservado" WHERE room_number = ?
+        ''', (room_number,))
+        self.conn.commit()
+
+        QtWidgets.QMessageBox.information(self, "Éxito", "Reserva creada exitosamente.")
+        self.add_reservation_widget.close()
+        self.load_reservations_data()
+        self.draw_rooms()
+
+    def edit_reservation(self, reservation_id):
+        # Función para editar una reserva existente
+        self.edit_reservation_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+
+        form_layout = QtWidgets.QFormLayout()
+
+        self.cursor.execute('''
+            SELECT guests.name, guests.phone, guests.email, guests.num_occupants,
+            reservations.room_number, reservations.check_in_date, reservations.check_out_date,
+            reservations.price_per_night, reservations.notes
+            FROM reservations
+            JOIN guests ON reservations.guest_id = guests.guest_id
+            WHERE reservations.reservation_id = ?
+        ''', (reservation_id,))
+        data = self.cursor.fetchone()
+
+        if data:
+            guest_name, guest_phone, guest_email, num_occupants, room_number, check_in_date, check_out_date, price_per_night, notes = data
+
+            self.edit_guest_name_input = QtWidgets.QLineEdit(guest_name)
+            self.edit_guest_phone_input = QtWidgets.QLineEdit(guest_phone)
+            self.edit_guest_email_input = QtWidgets.QLineEdit(guest_email)
+            self.edit_num_occupants_input = QtWidgets.QSpinBox()
+            self.edit_num_occupants_input.setMinimum(1)
+            self.edit_num_occupants_input.setValue(num_occupants)
+            self.edit_room_number_input = QtWidgets.QComboBox()
+            self.load_available_rooms_edit(room_number)
+            self.edit_check_in_date_input = QtWidgets.QDateEdit(QtCore.QDate.fromString(check_in_date, 'yyyy-MM-dd'))
+            self.edit_check_out_date_input = QtWidgets.QDateEdit(QtCore.QDate.fromString(check_out_date, 'yyyy-MM-dd'))
+            self.edit_price_per_night_input = QtWidgets.QLineEdit(str(price_per_night))
+            self.edit_notes_input = QtWidgets.QTextEdit(notes)
+
+            form_layout.addRow("Nombre del Huésped:", self.edit_guest_name_input)
+            form_layout.addRow("Teléfono del Huésped:", self.edit_guest_phone_input)
+            form_layout.addRow("Email del Huésped:", self.edit_guest_email_input)
+            form_layout.addRow("Número de Ocupantes:", self.edit_num_occupants_input)
+            form_layout.addRow("Número de Habitación:", self.edit_room_number_input)
+            form_layout.addRow("Fecha de Check-In:", self.edit_check_in_date_input)
+            form_layout.addRow("Fecha de Check-Out:", self.edit_check_out_date_input)
+            form_layout.addRow("Tarifa por Noche:", self.edit_price_per_night_input)
+            form_layout.addRow("Notas:", self.edit_notes_input)
+
+            self.update_reservation_button = QtWidgets.QPushButton("Actualizar Reserva")
+            self.update_reservation_button.clicked.connect(lambda: self.update_reservation(reservation_id))
+
+            layout.addLayout(form_layout)
+            layout.addWidget(self.update_reservation_button)
+
+            self.edit_reservation_widget.setLayout(layout)
+            self.edit_reservation_widget.setWindowTitle("Editar Reserva")
+            self.edit_reservation_widget.setGeometry(200, 200, 400, 600)
+            self.edit_reservation_widget.show()
+
+    def load_available_rooms_edit(self, current_room_number):
+        self.edit_room_number_input.clear()
+        self.cursor.execute('SELECT room_number FROM rooms WHERE status = "Disponible" OR room_number = ?', (current_room_number,))
+        rooms = self.cursor.fetchall()
+        for room in rooms:
+            self.edit_room_number_input.addItem(str(room[0]))
+        index = self.edit_room_number_input.findText(str(current_room_number))
+        self.edit_room_number_input.setCurrentIndex(index)
+
+    def update_reservation(self, reservation_id):
+        guest_name = self.edit_guest_name_input.text()
+        guest_phone = self.edit_guest_phone_input.text()
+        guest_email = self.edit_guest_email_input.text()
+        num_occupants = self.edit_num_occupants_input.value()
+        new_room_number = self.edit_room_number_input.currentText()
+        check_in_date = self.edit_check_in_date_input.date().toString('yyyy-MM-dd')
+        check_out_date = self.edit_check_out_date_input.date().toString('yyyy-MM-dd')
+        price_per_night = self.edit_price_per_night_input.text()
+        notes = self.edit_notes_input.toPlainText()
+
+        try:
+            price_per_night = float(price_per_night)
+        except ValueError:
+            QtWidgets.QMessageBox.warning(self, "Error", "La tarifa por noche debe ser un número.")
+            return
+
+        # Calcular número de noches
+        check_in = datetime.datetime.strptime(check_in_date, '%Y-%m-%d')
+        check_out = datetime.datetime.strptime(check_out_date, '%Y-%m-%d')
+        num_nights = (check_out - check_in).days
+        if num_nights <= 0:
+            QtWidgets.QMessageBox.warning(self, "Error", "La fecha de check-out debe ser posterior a la de check-in.")
+            return
+
+        total_cost = num_nights * price_per_night
+
+        # Actualizar reserva
+        self.cursor.execute('''
+            UPDATE reservations
+            SET room_number = ?, check_in_date = ?, check_out_date = ?, num_nights = ?, price_per_night = ?, total_cost = ?, notes = ?
+            WHERE reservation_id = ?
+        ''', (new_room_number, check_in_date, check_out_date, num_nights, price_per_night, total_cost, notes, reservation_id))
+
+        # Actualizar datos del huésped
+        self.cursor.execute('''
+            SELECT guest_id FROM reservations WHERE reservation_id = ?
+        ''', (reservation_id,))
+        guest_id = self.cursor.fetchone()[0]
+        self.cursor.execute('''
+            UPDATE guests
+            SET name = ?, phone = ?, email = ?, num_occupants = ?
+            WHERE guest_id = ?
+        ''', (guest_name, guest_phone, guest_email, num_occupants, guest_id))
+
+        self.conn.commit()
+        QtWidgets.QMessageBox.information(self, "Éxito", "Reserva actualizada exitosamente.")
+        self.edit_reservation_widget.close()
+        self.load_reservations_data()
+        self.draw_rooms()
+
+    def delete_reservation(self, reservation_id):
+        reply = QtWidgets.QMessageBox.question(self, 'Eliminar Reserva',
+                                               '¿Estás seguro de que deseas eliminar esta reserva?',
+                                               QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No, QtWidgets.QMessageBox.No)
+        if reply == QtWidgets.QMessageBox.Yes:
+            # Obtener room_number antes de eliminar
+            self.cursor.execute('SELECT room_number FROM reservations WHERE reservation_id = ?', (reservation_id,))
+            room_number = self.cursor.fetchone()[0]
+
+            self.cursor.execute('DELETE FROM reservations WHERE reservation_id = ?', (reservation_id,))
+            self.conn.commit()
+
+            # Actualizar estado de la habitación
+            self.cursor.execute('''
+                UPDATE rooms SET status = "Disponible" WHERE room_number = ?
+            ''', (room_number,))
+            self.conn.commit()
+
+            QtWidgets.QMessageBox.information(self, "Éxito", "Reserva eliminada exitosamente.")
+            self.load_reservations_data()
+            self.draw_rooms()
+
+    def guest_management_tab(self):
+        # Pestaña de gestión de huéspedes
+        self.guests_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.guests_tab, "Huéspedes")
+
+        layout = QtWidgets.QVBoxLayout()
+        self.guests_table = QtWidgets.QTableWidget()
+        self.guests_table.setColumnCount(7)
+        self.guests_table.setHorizontalHeaderLabels(['ID', 'Nombre', 'Teléfono', 'Email', 'Estado', 'Cargos Extras', 'Acciones'])
+        self.load_guests_data()
+
+        layout.addWidget(self.guests_table)
+        self.guests_tab.setLayout(layout)
+
+    def load_guests_data(self):
+        self.cursor.execute('SELECT guest_id, name, phone, email, status, extra_charges FROM guests')
+        guests = self.cursor.fetchall()
+        self.guests_table.setRowCount(0)
+        for row_number, row_data in enumerate(guests):
+            self.guests_table.insertRow(row_number)
+            for column_number, data in enumerate(row_data):
+                self.guests_table.setItem(row_number, column_number, QtWidgets.QTableWidgetItem(str(data)))
+            # Botón de acciones
+            action_button = QtWidgets.QPushButton("Agregar Cargos")
+            action_button.clicked.connect(lambda checked, gid=row_data[0]: self.add_extra_charges(gid))
+            self.guests_table.setCellWidget(row_number, 6, action_button)
+
+    def add_extra_charges(self, guest_id):
+        # Ventana para agregar cargos extras al huésped
+        self.add_charges_widget = QtWidgets.QWidget()
+        layout = QtWidgets.QVBoxLayout()
+
+        form_layout = QtWidgets.QFormLayout()
+        self.extra_charges_input = QtWidgets.QLineEdit()
+
+        form_layout.addRow("Cargos Extras:", self.extra_charges_input)
+
+        self.save_charges_button = QtWidgets.QPushButton("Guardar Cargos")
+        self.save_charges_button.clicked.connect(lambda: self.save_extra_charges(guest_id))
+
+        layout.addLayout(form_layout)
+        layout.addWidget(self.save_charges_button)
+
+        self.add_charges_widget.setLayout(layout)
+        self.add_charges_widget.setWindowTitle("Agregar Cargos Extras")
+        self.add_charges_widget.setGeometry(200, 200, 300, 150)
+        self.add_charges_widget.show()
+
+    def save_extra_charges(self, guest_id):
+        extra_charges = self.extra_charges_input.text()
+
+        try:
+            extra_charges = float(extra_charges)
+        except ValueError:
+            QtWidgets.QMessageBox.warning(self, "Error", "Los cargos extras deben ser un número.")
+            return
+
+        self.cursor.execute('''
+            UPDATE guests SET extra_charges = extra_charges + ? WHERE guest_id = ?
+        ''', (extra_charges, guest_id))
+        self.conn.commit()
+        QtWidgets.QMessageBox.information(self, "Éxito", "Cargos extras agregados exitosamente.")
+        self.add_charges_widget.close()
+        self.load_guests_data()
+
+    def reports_tab(self):
+        # Pestaña de reportes y análisis
+        self.reports_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.reports_tab, "Reportes")
+
+        layout = QtWidgets.QVBoxLayout()
+
+        self.generate_income_report_button = QtWidgets.QPushButton("Generar Reporte de Ingresos")
+        self.generate_income_report_button.clicked.connect(self.generate_income_report)
+
+        self.generate_supplier_report_button = QtWidgets.QPushButton("Generar Reporte de Deudas a Proveedores")
+        self.generate_supplier_report_button.clicked.connect(self.generate_supplier_debt_report)
+
+        self.export_report_button = QtWidgets.QPushButton("Exportar Reporte")
+        self.export_report_button.clicked.connect(self.export_report)
+
+        layout.addWidget(self.generate_income_report_button)
+        layout.addWidget(self.generate_supplier_report_button)
+        layout.addWidget(self.export_report_button)
+
+        self.reports_tab.setLayout(layout)
+
+    def generate_income_report(self):
+        # Generar un reporte de ingresos
+        self.cursor.execute('''
+            SELECT check_in_date, total_cost FROM reservations
+        ''')
+        data = self.cursor.fetchall()
+        dates = [datetime.datetime.strptime(row[0], '%Y-%m-%d') for row in data]
+        amounts = [row[1] for row in data]
+
+        df = pd.DataFrame({'Fecha': dates, 'Ingresos': amounts})
+        df = df.groupby('Fecha').sum().reset_index()
+
+        plt.figure(figsize=(10,5))
+        plt.bar(df['Fecha'], df['Ingresos'], color='green')
+        plt.xlabel('Fecha')
+        plt.ylabel('Ingresos')
+        plt.title('Reporte de Ingresos')
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        plt.gcf().autofmt_xdate()
+        plt.savefig('ingresos.png')
+        plt.show()
+
+    def generate_supplier_debt_report(self):
+        # Generar un reporte de deudas a proveedores
+        self.cursor.execute('''
+            SELECT debt_date, amount_due FROM suppliers
+        ''')
+        data = self.cursor.fetchall()
+        dates = [datetime.datetime.strptime(row[0], '%Y-%m-%d') for row in data]
+        amounts = [row[1] for row in data]
+
+        df = pd.DataFrame({'Fecha': dates, 'Deuda': amounts})
+        df = df.groupby('Fecha').sum().reset_index()
+
+        plt.figure(figsize=(10,5))
+        plt.bar(df['Fecha'], df['Deuda'], color='red')
+        plt.xlabel('Fecha')
+        plt.ylabel('Deuda')
+        plt.title('Reporte de Deudas a Proveedores')
+        plt.gca().xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d'))
+        plt.gcf().autofmt_xdate()
+        plt.savefig('deudas_proveedores.png')
+        plt.show()
+
+    def export_report(self):
+        # Exportar reportes a PDF o Word
+        options = QtWidgets.QFileDialog.Options()
+        file_name, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Guardar Reporte", "", "PDF Files (*.pdf);;Word Files (*.docx)", options=options)
+        if file_name:
+            if file_name.endswith('.pdf'):
+                c = canvas.Canvas(file_name, pagesize=letter)
+                c.drawString(100, 750, "Reporte General")
+                c.drawString(100, 730, f"Generado por: {self.current_user_name}")
+                c.drawImage('ingresos.png', 50, 400, width=500, height=300)
+                c.drawImage('deudas_proveedores.png', 50, 50, width=500, height=300)
+                c.save()
+                QtWidgets.QMessageBox.information(self, "Reporte Generado", f"El reporte ha sido guardado en '{file_name}'.")
+            elif file_name.endswith('.docx'):
+                doc = Document()
+                doc.add_heading('Reporte General', 0)
+                doc.add_paragraph(f"Generado por: {self.current_user_name}")
+                doc.add_picture('ingresos.png', width=Inches(6))
+                doc.add_picture('deudas_proveedores.png', width=Inches(6))
+                doc.save(file_name)
+                QtWidgets.QMessageBox.information(self, "Reporte Generado", f"El reporte ha sido guardado en '{file_name}'.")
+            else:
+                QtWidgets.QMessageBox.warning(self, "Error", "El formato de archivo no es compatible.")
+
+    # ==== INICIO DEL SISTEMA DE HORARIOS LABORALES ====
+    def horarios_laborales_tab(self):
+        """Pestaña para la gestión de horarios laborales"""
+        self.horarios_tab = QtWidgets.QWidget()
+        self.tabs.addTab(self.horarios_tab, "Horarios Laborales")
+        
+        main_layout = QtWidgets.QVBoxLayout()
+        
+        # Crear tabs para las diferentes funciones
+        self.horarios_subtabs = QtWidgets.QTabWidget()
+        self.trabajadores_tab = QtWidgets.QWidget()
+        self.crear_horarios_tab = QtWidgets.QWidget()
+        self.resumen_tab = QtWidgets.QWidget()
+        
+        self.horarios_subtabs.addTab(self.trabajadores_tab, "Trabajadores")
+        self.horarios_subtabs.addTab(self.crear_horarios_tab, "Crear Horarios")
+        self.horarios_subtabs.addTab(self.resumen_tab, "Resumen")
+        
+        # Configurar las subtabs
+        self.setup_trabajadores_tab()
+        self.setup_crear_horarios_tab()
+        self.setup_resumen_tab()
+        
+        main_layout.addWidget(self.horarios_subtabs)
+        self.horarios_tab.setLayout(main_layout)
+        
+        # Cargar datos iniciales
+        self.cargar_trabajadores_desde_bd()
+    
+    def setup_trabajadores_tab(self):
+        """Configurar la tab de gestión de trabajadores"""
+        layout = QtWidgets.QVBoxLayout()
+        
+        # Frame para agregar trabajadores
+        frame_agregar = QtWidgets.QGroupBox("Agregar Trabajador")
+        form_layout = QtWidgets.QFormLayout()
+        
+        # Formulario para agregar trabajador
+        self.nombre_trabajador_input = QtWidgets.QLineEdit()
+        self.preferencia_horario_combo = QtWidgets.QComboBox()
+        self.preferencia_horario_combo.addItems([
+            "Jornada Completa", "Medio Tiempo", "Turno Mañana", 
+            "Turno Tarde", "Turno Noche", "Flexible"
+        ])
+        self.horas_semanales_input = QtWidgets.QSpinBox()
+        self.horas_semanales_input.setRange(1, 48)
+        self.horas_semanales_input.setValue(40)
+        
+        # Checkboxes para días de descanso
+        dias_frame = QtWidgets.QWidget()
+        dias_layout = QtWidgets.QHBoxLayout()
+        self.dias_descanso_checks = {}
+        dias = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+        
+        for dia in dias:
+            checkbox = QtWidgets.QCheckBox(dia)
+            if dia == "Domingo":
+                checkbox.setChecked(True)
+            dias_layout.addWidget(checkbox)
+            self.dias_descanso_checks[dia] = checkbox
+        
+        dias_frame.setLayout(dias_layout)
+        
+        # Agregar widgets al form layout
+        form_layout.addRow("Nombre:", self.nombre_trabajador_input)
+        form_layout.addRow("Preferencia de horario:", self.preferencia_horario_combo)
+        form_layout.addRow("Horas semanales:", self.horas_semanales_input)
+        form_layout.addRow("Días de descanso:", dias_frame)
+        
+        # Botón para agregar trabajador
+        self.agregar_trabajador_btn = QtWidgets.QPushButton("Agregar Trabajador")
+        self.agregar_trabajador_btn.clicked.connect(self.agregar_trabajador)
+        form_layout.addRow("", self.agregar_trabajador_btn)
+        
+        frame_agregar.setLayout(form_layout)
+        
+        # Tabla para mostrar trabajadores
+        frame_lista = QtWidgets.QGroupBox("Trabajadores Registrados")
+        lista_layout = QtWidgets.QVBoxLayout()
+        
+        self.trabajadores_table = QtWidgets.QTableWidget()
+        self.trabajadores_table.setColumnCount(4)
+        self.trabajadores_table.setHorizontalHeaderLabels([
+            'Nombre', 'Preferencia de Horario', 'Horas Semanales', 'Días de Descanso'
+        ])
+        self.trabajadores_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        
+        # Botones para acciones
+        btn_frame = QtWidgets.QWidget()
+        btn_layout = QtWidgets.QHBoxLayout()
+        
+        self.editar_trabajador_btn = QtWidgets.QPushButton("Editar Trabajador")
+        self.editar_trabajador_btn.clicked.connect(self.editar_trabajador)
+        self.eliminar_trabajador_btn = QtWidgets.QPushButton("Eliminar Trabajador")
+        self.eliminar_trabajador_btn.clicked.connect(self.eliminar_trabajador)
+        
+        btn_layout.addWidget(self.editar_trabajador_btn)
+        btn_layout.addWidget(self.eliminar_trabajador_btn)
+        btn_frame.setLayout(btn_layout)
+        
+        lista_layout.addWidget(self.trabajadores_table)
+        lista_layout.addWidget(btn_frame)
+        frame_lista.setLayout(lista_layout)
+        
+        # Agregar frames al layout principal
+        layout.addWidget(frame_agregar)
+        layout.addWidget(frame_lista)
+        
+        self.trabajadores_tab.setLayout(layout)
+    
+    def setup_crear_horarios_tab(self):
+        """Configurar la tab de creación de horarios"""
+        layout = QtWidgets.QVBoxLayout()
+        
+        # Frame para seleccionar período
+        frame_periodo = QtWidgets.QGroupBox("Seleccionar Período")
+        periodo_layout = QtWidgets.QGridLayout()
+        
+        # Widgets para seleccionar año, mes y semana
+        periodo_layout.addWidget(QtWidgets.QLabel("Año:"), 0, 0)
+        self.anio_combo = QtWidgets.QComboBox()
+        self.anio_combo.addItems([str(y) for y in range(self.anio_actual, self.anio_actual + 26)])
+        periodo_layout.addWidget(self.anio_combo, 0, 1)
+        
+        periodo_layout.addWidget(QtWidgets.QLabel("Mes:"), 0, 2)
+        self.mes_combo = QtWidgets.QComboBox()
+        self.mes_combo.addItems([
+            "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", 
+            "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"
+        ])
+        self.mes_combo.setCurrentIndex(datetime.datetime.now().month - 1)
+        periodo_layout.addWidget(self.mes_combo, 0, 3)
+        
+        periodo_layout.addWidget(QtWidgets.QLabel("Semana:"), 0, 4)
+        self.semana_combo = QtWidgets.QComboBox()
+        periodo_layout.addWidget(self.semana_combo, 0, 5)
+        
+        # Conectar eventos para actualizar semanas
+        self.anio_combo.currentIndexChanged.connect(self.actualizar_semanas)
+        self.mes_combo.currentIndexChanged.connect(self.actualizar_semanas)
+        
+        # Botones para gestionar horarios
+        btn_frame = QtWidgets.QWidget()
+        btn_layout = QtWidgets.QHBoxLayout()
+        
+        self.generar_horario_btn = QtWidgets.QPushButton("Generar Horario")
+        self.generar_horario_btn.clicked.connect(self.generar_horario)
+        
+        self.asignar_auto_btn = QtWidgets.QPushButton("Asignar Horarios Automáticos")
+        self.asignar_auto_btn.clicked.connect(self.asignar_horarios_automaticos)
+        
+        self.limpiar_horario_btn = QtWidgets.QPushButton("Limpiar Horario")
+        self.limpiar_horario_btn.clicked.connect(self.limpiar_horario)
+        
+        btn_layout.addWidget(self.generar_horario_btn)
+        btn_layout.addWidget(self.asignar_auto_btn)
+        btn_layout.addWidget(self.limpiar_horario_btn)
+        btn_frame.setLayout(btn_layout)
+        
+        periodo_layout.addWidget(btn_frame, 1, 0, 1, 6)
+        frame_periodo.setLayout(periodo_layout)
+        
+        # Tabla para mostrar horarios
+        frame_horario = QtWidgets.QGroupBox("Horario Semanal")
+        horario_layout = QtWidgets.QVBoxLayout()
+        
+        self.horario_table = QtWidgets.QTableWidget()
+        self.horario_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.horario_table.doubleClicked.connect(self.editar_celda_horario)
+        
+        horario_layout.addWidget(self.horario_table)
+        frame_horario.setLayout(horario_layout)
+        
+        # Frame para exportación
+        frame_exportar = QtWidgets.QGroupBox("Exportar Horario")
+        exportar_layout = QtWidgets.QHBoxLayout()
+        
+        self.exportar_pdf_btn = QtWidgets.QPushButton("Exportar a PDF")
+        self.exportar_pdf_btn.clicked.connect(self.exportar_horario_pdf)
+        
+        self.exportar_excel_btn = QtWidgets.QPushButton("Exportar a Excel")
+        self.exportar_excel_btn.clicked.connect(self.exportar_horario_excel)
+        
+        exportar_layout.addWidget(self.exportar_pdf_btn)
+        exportar_layout.addWidget(self.exportar_excel_btn)
+        frame_exportar.setLayout(exportar_layout)
+        
+        # Agregar todos los frames al layout principal
+        layout.addWidget(frame_periodo)
+        layout.addWidget(frame_horario)
+        layout.addWidget(frame_exportar)
+        
+        self.crear_horarios_tab.setLayout(layout)
+        
+        # Inicializar semanas
+        self.actualizar_semanas()
+    
+    def setup_resumen_tab(self):
+        """Configurar la tab de resumen de horas"""
+        layout = QtWidgets.QVBoxLayout()
+        
+        # Frame para mostrar resumen
+        frame_resumen = QtWidgets.QGroupBox("Resumen de Horas Trabajadas")
+        resumen_layout = QtWidgets.QVBoxLayout()
+        
+        self.resumen_table = QtWidgets.QTableWidget()
+        self.resumen_table.setColumnCount(5)
+        self.resumen_table.setHorizontalHeaderLabels([
+            'Trabajador', 'Horas Programadas', 'Horas Extras', 'Total', 'Días Laborados'
+        ])
+        
+        # Botón para calcular resumen
+        self.calcular_resumen_btn = QtWidgets.QPushButton("Calcular Resumen")
+        self.calcular_resumen_btn.clicked.connect(self.calcular_resumen)
+        
+        resumen_layout.addWidget(self.resumen_table)
+        resumen_layout.addWidget(self.calcular_resumen_btn)
+        frame_resumen.setLayout(resumen_layout)
+        
+        # Frame para información legal
+        frame_info = QtWidgets.QGroupBox("Información sobre la Ley Laboral en México")
+        info_layout = QtWidgets.QVBoxLayout()
+        
+        info_text = QtWidgets.QTextEdit()
+        info_text.setReadOnly(True)
+        info_text.setPlainText("""
+JORNADA LABORAL SEGÚN LA LEY FEDERAL DEL TRABAJO EN MÉXICO:
+
+- Jornada diurna: 8 horas (entre 6:00 y 20:00)
+- Jornada nocturna: 7 horas (entre 20:00 y 6:00)
+- Jornada mixta: 7.5 horas (períodos de jornada diurna y nocturna)
+- Máximo de horas semanales: 48 horas (jornada diurna)
+
+HORAS EXTRA:
+- Las primeras 9 horas extra semanales se pagan al doble.
+- A partir de la hora 10, se pagan al triple.
+- No deben exceder de 3 horas diarias ni de 3 veces por semana.
+
+DESCANSO SEMANAL:
+- Al menos un día de descanso por cada 6 días trabajados, con goce de salario íntegro.
+- Si se trabaja en día de descanso semanal, se pagará un salario doble.
+
+DÍAS FESTIVOS OFICIALES (CON GOCE DE SUELDO):
+- 1 de enero: Año Nuevo
+- Primer lunes de febrero: Día de la Constitución
+- Tercer lunes de marzo: Natalicio de Benito Juárez
+- 1 de mayo: Día del Trabajo
+- 16 de septiembre: Día de la Independencia
+- Tercer lunes de noviembre: Día de la Revolución Mexicana
+- 25 de diciembre: Navidad
+- Cada 6 años, el 1 de octubre: Transmisión del Poder Ejecutivo Federal
+
+PRIMA DOMINICAL:
+- 25% adicional sobre el salario cuando se trabaja en domingo.
+
+VACACIONES:
+- 6 días de vacaciones el primer año, aumentando 2 días por cada año adicional hasta llegar a 12.
+- Después del 4° año, aumenta 2 días por cada 5 años de servicio.
+- Prima vacacional del 25% sobre el salario de los días de vacaciones.
+        """)
+        
+        info_layout.addWidget(info_text)
+        frame_info.setLayout(info_layout)
+        
+        # Agregar frames al layout principal
+        layout.addWidget(frame_resumen)
+        layout.addWidget(frame_info)
+        
+        self.resumen_tab.setLayout(layout)
+    
+    def cargar_trabajadores_desde_bd(self):
+        """Cargar trabajadores desde la base de datos"""
+        try:
+            # Limpiar listas
+            self.trabajadores = []
+            self.dias_descanso = {}
+            self.horas_semanales = {}
+            
+            # Obtener trabajadores
+            self.cursor.execute('''
+                SELECT name FROM employees
+            ''')
+            employees = self.cursor.fetchall()
+            
+            # Limpiar tabla
+            self.trabajadores_table.setRowCount(0)
+            
+            for employee in employees:
+                employee_name = employee[0]
+                self.trabajadores.append(employee_name)
+                
+                # Obtener días de descanso
+                self.cursor.execute('''
+                    SELECT e.employee_id, r.day_of_week 
+                    FROM employees e
+                    LEFT JOIN rest_days r ON e.employee_id = r.employee_id
+                    WHERE e.name = ?
+                ''', (employee_name,))
+                
+                rest_days_data = self.cursor.fetchall()
+                employee_id = rest_days_data[0][0] if rest_days_data else None
+                
+                # Si no tiene días de descanso registrados, asignar domingo por defecto
+                rest_days = [row[1] for row in rest_days_data if row[1]]
+                if not rest_days:
+                    rest_days = ["Domingo"]
+                    # Insertar día de descanso por defecto si hay employee_id
+                    if employee_id:
+                        self.cursor.execute('''
+                            INSERT INTO rest_days (employee_id, day_of_week) VALUES (?, ?)
+                        ''', (employee_id, "Domingo"))
+                        self.conn.commit()
+                
+                self.dias_descanso[employee_name] = rest_days
+                
+                # Valores por defecto para preferencia y horas
+                preferencia = "Jornada Completa"
+                horas = 40
+                self.horas_semanales[employee_name] = horas
+                
+                # Agregar a la tabla
+                row_position = self.trabajadores_table.rowCount()
+                self.trabajadores_table.insertRow(row_position)
+                self.trabajadores_table.setItem(row_position, 0, QtWidgets.QTableWidgetItem(employee_name))
+                self.trabajadores_table.setItem(row_position, 1, QtWidgets.QTableWidgetItem(preferencia))
+                self.trabajadores_table.setItem(row_position, 2, QtWidgets.QTableWidgetItem(str(horas)))
+                self.trabajadores_table.setItem(row_position, 3, QtWidgets.QTableWidgetItem(", ".join(rest_days)))
+        
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Error al cargar trabajadores: {str(e)}")
+            print(f"Error en cargar_trabajadores_desde_bd: {e}")
+    
+    def agregar_trabajador(self):
+        """Agregar un nuevo trabajador al sistema de horarios"""
+        nombre = self.nombre_trabajador_input.text().strip()
+        if not nombre:
+            QtWidgets.QMessageBox.warning(self, "Error", "Por favor, ingrese un nombre")
+            return
+        
+        # Verificar si el trabajador ya existe
+        for row in range(self.trabajadores_table.rowCount()):
+            if self.trabajadores_table.item(row, 0).text() == nombre:
+                QtWidgets.QMessageBox.warning(self, "Error", f"El trabajador '{nombre}' ya existe")
+                return
+        
+        # Obtener días de descanso seleccionados
+        dias_descanso = []
+        for dia, checkbox in self.dias_descanso_checks.items():
+            if checkbox.isChecked():
+                dias_descanso.append(dia)
+        
+        if not dias_descanso:
+            QtWidgets.QMessageBox.warning(self, "Error", "Debe seleccionar al menos un día de descanso")
+            return
+        
+        preferencia = self.preferencia_horario_combo.currentText()
+        horas_semanales = self.horas_semanales_input.value()
+        
+        # Verificar si este empleado existe en la base de datos
+        self.cursor.execute('SELECT employee_id FROM employees WHERE name = ?', (nombre,))
+        result = self.cursor.fetchone()
+        
+        if not result:
+            # Si no existe, crear un nuevo empleado en la base de datos
+            password_hash = bcrypt.hashpw("temporal123".encode('utf-8'), bcrypt.gensalt())
+            self.cursor.execute('''
+                INSERT INTO employees (name, username, password, role) VALUES (?, ?, ?, ?)
+            ''', (nombre, nombre.lower().replace(" ", ""), password_hash, "Empleado"))
+            self.conn.commit()
+            
+            self.cursor.execute('SELECT employee_id FROM employees WHERE name = ?', (nombre,))
+            result = self.cursor.fetchone()
+        
+        employee_id = result[0]
+        
+        # Guardar días de descanso en la base de datos
+        for dia in dias_descanso:
+            self.cursor.execute('''
+                INSERT INTO rest_days (employee_id, day_of_week) VALUES (?, ?)
+            ''', (employee_id, dia))
+        
+        self.conn.commit()
+        
+        # Agregar a la lista interna y a la tabla
+        self.trabajadores.append(nombre)
+        self.dias_descanso[nombre] = dias_descanso
+        self.horas_semanales[nombre] = horas_semanales
+        
+        row_position = self.trabajadores_table.rowCount()
+        self.trabajadores_table.insertRow(row_position)
+        self.trabajadores_table.setItem(row_position, 0, QtWidgets.QTableWidgetItem(nombre))
+        self.trabajadores_table.setItem(row_position, 1, QtWidgets.QTableWidgetItem(preferencia))
+        self.trabajadores_table.setItem(row_position, 2, QtWidgets.QTableWidgetItem(str(horas_semanales)))
+        self.trabajadores_table.setItem(row_position, 3, QtWidgets.QTableWidgetItem(", ".join(dias_descanso)))
+        
+        # Limpiar campos
+        self.nombre_trabajador_input.clear()
+        self.preferencia_horario_combo.setCurrentIndex(0)
+        self.horas_semanales_input.setValue(40)
+        
+        # Resetear checkboxes excepto domingo
+        for dia, checkbox in self.dias_descanso_checks.items():
+            checkbox.setChecked(dia == "Domingo")
+        
+        QtWidgets.QMessageBox.information(self, "Éxito", f"Trabajador '{nombre}' agregado correctamente")
+    
+    def editar_trabajador(self):
+        """Editar un trabajador existente"""
+        selected_items = self.trabajadores_table.selectedItems()
+        if not selected_items:
+            QtWidgets.QMessageBox.warning(self, "Error", "Por favor, seleccione un trabajador para editar")
+            return
+        
+        selected_row = selected_items[0].row()
+        nombre = self.trabajadores_table.item(selected_row, 0).text()
+        preferencia = self.trabajadores_table.item(selected_row, 1).text()
+        horas = int(self.trabajadores_table.item(selected_row, 2).text())
+        dias_actuales = self.trabajadores_table.item(selected_row, 3).text().split(", ")
+        
+        # Crear diálogo de edición
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"Editar Trabajador: {nombre}")
+        dialog.setMinimumWidth(400)
+        
+        layout = QtWidgets.QVBoxLayout()
+        form = QtWidgets.QFormLayout()
+        
+        # Campos de edición
+        nombre_edit = QtWidgets.QLineEdit(nombre)
+        
+        preferencia_edit = QtWidgets.QComboBox()
+        preferencia_edit.addItems([
+            "Jornada Completa", "Medio Tiempo", "Turno Mañana", 
+            "Turno Tarde", "Turno Noche", "Flexible"
+        ])
+        preferencia_edit.setCurrentText(preferencia)
+        
+        horas_edit = QtWidgets.QSpinBox()
+        horas_edit.setRange(1, 48)
+        horas_edit.setValue(horas)
+        
+        # Checkboxes para días
+        dias_widget = QtWidgets.QWidget()
+        dias_layout = QtWidgets.QVBoxLayout()
+        dias_checks = {}
+        dias = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
+        
+        for dia in dias:
+            check = QtWidgets.QCheckBox(dia)
+            check.setChecked(dia in dias_actuales)
+            dias_layout.addWidget(check)
+            dias_checks[dia] = check
+        
+        dias_widget.setLayout(dias_layout)
+        
+        # Agregar widgets al formulario
+        form.addRow("Nombre:", nombre_edit)
+        form.addRow("Preferencia:", preferencia_edit)
+        form.addRow("Horas semanales:", horas_edit)
+        form.addRow("Días de descanso:", dias_widget)
+        
+        # Botones
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        dialog.setLayout(layout)
+        
+        # Ejecutar diálogo
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            nuevo_nombre = nombre_edit.text().strip()
+            
+            if not nuevo_nombre:
+                QtWidgets.QMessageBox.warning(self, "Error", "El nombre no puede estar vacío")
+                return
+            
+            # Verificar si el nuevo nombre ya existe (si es diferente)
+            if nuevo_nombre != nombre:
+                for row in range(self.trabajadores_table.rowCount()):
+                    if row != selected_row and self.trabajadores_table.item(row, 0).text() == nuevo_nombre:
+                        QtWidgets.QMessageBox.warning(self, "Error", f"Ya existe un trabajador con el nombre '{nuevo_nombre}'")
+                        return
+            
+            # Obtener nuevos días de descanso
+            nuevos_dias = []
+            for dia, check in dias_checks.items():
+                if check.isChecked():
+                    nuevos_dias.append(dia)
+            
+            if not nuevos_dias:
+                QtWidgets.QMessageBox.warning(self, "Error", "Debe seleccionar al menos un día de descanso")
+                return
+            
+            nueva_preferencia = preferencia_edit.currentText()
+            nuevas_horas = horas_edit.value()
+            
+            # Actualizar empleado en la base de datos
+            self.cursor.execute('SELECT employee_id FROM employees WHERE name = ?', (nombre,))
+            result = self.cursor.fetchone()
+            
+            if result:
+                employee_id = result[0]
+                
+                # Actualizar nombre si cambió
+                if nuevo_nombre != nombre:
+                    self.cursor.execute('''
+                        UPDATE employees SET name = ? WHERE employee_id = ?
+                    ''', (nuevo_nombre, employee_id))
+                
+                # Eliminar días de descanso antiguos
+                self.cursor.execute('DELETE FROM rest_days WHERE employee_id = ?', (employee_id,))
+                
+                # Insertar nuevos días de descanso
+                for dia in nuevos_dias:
+                    self.cursor.execute('''
+                        INSERT INTO rest_days (employee_id, day_of_week) VALUES (?, ?)
+                    ''', (employee_id, dia))
+                
+                self.conn.commit()
+            
+            # Actualizar listas internas
+            if nuevo_nombre != nombre:
+                # Actualizar el nombre en la lista
+                index = self.trabajadores.index(nombre)
+                self.trabajadores[index] = nuevo_nombre
+                
+                # Actualizar diccionarios
+                self.dias_descanso[nuevo_nombre] = self.dias_descanso.pop(nombre, [])
+                self.horas_semanales[nuevo_nombre] = self.horas_semanales.pop(nombre, 40)
+            
+            # Actualizar datos
+            self.dias_descanso[nuevo_nombre] = nuevos_dias
+            self.horas_semanales[nuevo_nombre] = nuevas_horas
+            
+            # Actualizar tabla
+            self.trabajadores_table.setItem(selected_row, 0, QtWidgets.QTableWidgetItem(nuevo_nombre))
+            self.trabajadores_table.setItem(selected_row, 1, QtWidgets.QTableWidgetItem(nueva_preferencia))
+            self.trabajadores_table.setItem(selected_row, 2, QtWidgets.QTableWidgetItem(str(nuevas_horas)))
+            self.trabajadores_table.setItem(selected_row, 3, QtWidgets.QTableWidgetItem(", ".join(nuevos_dias)))
+            
+            QtWidgets.QMessageBox.information(self, "Éxito", f"Trabajador '{nuevo_nombre}' actualizado correctamente")
+    
+    def eliminar_trabajador(self):
+        """Eliminar un trabajador del sistema de horarios"""
+        selected_items = self.trabajadores_table.selectedItems()
+        if not selected_items:
+            QtWidgets.QMessageBox.warning(self, "Error", "Por favor, seleccione un trabajador para eliminar")
+            return
+        
+        selected_row = selected_items[0].row()
+        nombre = self.trabajadores_table.item(selected_row, 0).text()
+        
+        reply = QtWidgets.QMessageBox.question(
+            self, "Confirmar eliminación", 
+            f"¿Está seguro de que desea eliminar al trabajador '{nombre}'?\n\nEsto solo eliminará los datos de horarios, no el empleado del sistema.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        
+        if reply == QtWidgets.QMessageBox.Yes:
+            # Eliminar trabajador de las estructuras de datos
+            if nombre in self.trabajadores:
+                self.trabajadores.remove(nombre)
+            
+            if nombre in self.dias_descanso:
+                del self.dias_descanso[nombre]
+            
+            if nombre in self.horas_semanales:
+                del self.horas_semanales[nombre]
+            
+            # Eliminar días de descanso de la base de datos
+            self.cursor.execute('SELECT employee_id FROM employees WHERE name = ?', (nombre,))
+            result = self.cursor.fetchone()
+            
+            if result:
+                employee_id = result[0]
+                self.cursor.execute('DELETE FROM rest_days WHERE employee_id = ?', (employee_id,))
+                self.conn.commit()
+            
+            # Eliminar de la tabla
+            self.trabajadores_table.removeRow(selected_row)
+            
+            QtWidgets.QMessageBox.information(self, "Éxito", f"Trabajador '{nombre}' eliminado correctamente")
+    
+    def actualizar_semanas(self):
+        """Actualizar la lista de semanas según el año y mes seleccionados"""
+        try:
+            anio = int(self.anio_combo.currentText())
+            mes_idx = self.mes_combo.currentIndex() + 1
+            
+            # Obtener el número de días en el mes
+            num_dias = calendar.monthrange(anio, mes_idx)[1]
+            
+            # Crear lista de semanas (de lunes a domingo)
+            semanas = []
+            
+            # Encontrar el primer lunes del mes
+            primer_dia = datetime.date(anio, mes_idx, 1)
+            dias_hasta_lunes = (7 - primer_dia.weekday()) % 7
+            
+            if dias_hasta_lunes > 0:
+                # Si el mes no comienza en lunes, crear semana parcial
+                inicio = primer_dia
+                fin = inicio + timedelta(days=dias_hasta_lunes - 1)
+                semanas.append(f"{inicio.day} - {fin.day}")
+            
+            # Crear semanas completas (lunes a domingo)
+            dia = primer_dia + timedelta(days=dias_hasta_lunes)
+            while dia.month == mes_idx:
+                inicio = dia
+                fin = min(inicio + timedelta(days=6), datetime.date(anio, mes_idx, num_dias))
+                semanas.append(f"{inicio.day} - {fin.day}")
+                dia = fin + timedelta(days=1)
+                
+                # Si llegamos al final del mes, salir
+                if dia.month != mes_idx:
+                    break
+            
+            # Actualizar el combobox de semanas
+            self.semana_combo.clear()
+            self.semana_combo.addItems(semanas)
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Error al actualizar semanas: {str(e)}")
+            print(f"Error en actualizar_semanas: {e}")
+    
+    def obtener_rango_fechas(self):
+        """Obtiene el rango de fechas seleccionado en el combobox de semanas"""
+        try:
+            if self.semana_combo.currentText() == "":
+                return None, None
+                
+            anio = int(self.anio_combo.currentText())
+            mes_idx = self.mes_combo.currentIndex() + 1
+            
+            # Extraer el rango de días de la semana seleccionada
+            rango = self.semana_combo.currentText().split(" - ")
+            dia_inicio = int(rango[0])
+            dia_fin = int(rango[1])
+            
+            fecha_inicio = datetime.date(anio, mes_idx, dia_inicio)
+            fecha_fin = datetime.date(anio, mes_idx, dia_fin)
+            
+            return fecha_inicio, fecha_fin
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Error al obtener rango de fechas: {str(e)}")
+            print(f"Error en obtener_rango_fechas: {e}")
+            return None, None
+    
+    def generar_horario(self):
+        """Generar la estructura del horario semanal"""
+        # Verificar si hay trabajadores
+        if not self.trabajadores:
+            QtWidgets.QMessageBox.warning(self, "Error", "No hay trabajadores para asignar horarios")
+            return
+        
+        # Obtener el rango de fechas
+        fecha_inicio, fecha_fin = self.obtener_rango_fechas()
+        if not fecha_inicio or not fecha_fin:
+            QtWidgets.QMessageBox.warning(self, "Error", "No se pudo determinar el rango de fechas")
+            return
+        
+        # Configurar columnas de la tabla de horarios
+        columnas = ['Trabajador']
+        fechas = []
+        fecha_actual = fecha_inicio
+        
+        while fecha_actual <= fecha_fin:
+            dia_semana = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"][fecha_actual.weekday()]
+            columnas.append(f"{fecha_actual.day} {dia_semana}")
+            fechas.append(fecha_actual)
+            fecha_actual += datetime.timedelta(days=1)
+        
+        # Configurar la tabla
+        self.horario_table.setColumnCount(len(columnas))
+        self.horario_table.setHorizontalHeaderLabels(columnas)
+        self.horario_table.setRowCount(0)
+        
+        # Dar formato a las columnas
+        for col in range(self.horario_table.columnCount()):
+            if col > 0:  # Ignorar la columna de trabajador
+                fecha = fechas[col-1]
+                if fecha.weekday() == 5:  # Sábado
+                    for row in range(self.horario_table.rowCount()):
+                        item = self.horario_table.item(row, col)
+                        if item:
+                            item.setBackground(QtGui.QColor('lightblue'))
+                elif fecha.weekday() == 6:  # Domingo
+                    for row in range(self.horario_table.rowCount()):
+                        item = self.horario_table.item(row, col)
+                        if item:
+                            item.setBackground(QtGui.QColor('lightcoral'))
+        
+        # Agregar trabajadores a la tabla
+        for trabajador in self.trabajadores:
+            row_position = self.horario_table.rowCount()
+            self.horario_table.insertRow(row_position)
+            self.horario_table.setItem(row_position, 0, QtWidgets.QTableWidgetItem(trabajador))
+            
+            for col, fecha in enumerate(fechas, 1):
+                # Comprobar si es día de descanso para este trabajador
+                dia_semana = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"][fecha.weekday()]
+                
+                if dia_semana in self.dias_descanso.get(trabajador, []):
+                    item = QtWidgets.QTableWidgetItem("DESCANSO")
+                    item.setBackground(QtGui.QColor('lightyellow'))
+                    self.horario_table.setItem(row_position, col, item)
+                else:
+                    self.horario_table.setItem(row_position, col, QtWidgets.QTableWidgetItem(""))
+        
+        # Ajustar tamaño de columnas
+        self.horario_table.resizeColumnsToContents()
+        
+        QtWidgets.QMessageBox.information(self, "Éxito", "Estructura de horario generada correctamente")
+    
+    def editar_celda_horario(self, index):
+        """Editar el horario en una celda específica"""
+        # No editar la columna de trabajadores
+        if index.column() == 0:
+            return
+        
+        # Obtener datos de la celda
+        trabajador = self.horario_table.item(index.row(), 0).text()
+        dia = self.horario_table.horizontalHeaderItem(index.column()).text()
+        valor_actual = self.horario_table.item(index.row(), index.column()).text()
+        
+        # Si es día de descanso, no permitir edición
+        if valor_actual == "DESCANSO":
+            QtWidgets.QMessageBox.information(
+                self, 
+                "Día de Descanso",
+                f"Este día está asignado como descanso para {trabajador}.\n\n"
+                "Para cambiarlo, modifique los días de descanso en la pestaña de Trabajadores."
+            )
+            return
+        
+        # Parsear el horario actual si existe
+        hora_entrada = ""
+        hora_salida = ""
+        horas_extra = ""
+        
+        if valor_actual and valor_actual != "DESCANSO":
+            # Puede tener formato: "HH:MM-HH:MM" o "HH:MM-HH:MM +HH:MM=HH:MM"
+            partes = valor_actual.split(" ")
+            horas_base = partes[0].split("-")
+            if len(horas_base) == 2:
+                hora_entrada = horas_base[0]
+                hora_salida = horas_base[1]
+            
+            if len(partes) > 1 and partes[1].startswith("+"):
+                horas_extra = partes[1][1:].split("=")[0]
+        
+        # Crear diálogo para editar el horario
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle(f"Editar Horario: {trabajador} - {dia}")
+        dialog.setMinimumWidth(400)
+        
+        layout = QtWidgets.QVBoxLayout()
+        
+        # Título
+        label = QtWidgets.QLabel(f"Horario para {trabajador} el día {dia}")
+        label.setAlignment(QtCore.Qt.AlignCenter)
+        font = QtGui.QFont()
+        font.setBold(True)
+        label.setFont(font)
+        layout.addWidget(label)
+        
+        # Formulario
+        form = QtWidgets.QFormLayout()
+        
+        entrada_edit = QtWidgets.QLineEdit(hora_entrada)
+        salida_edit = QtWidgets.QLineEdit(hora_salida)
+        extra_edit = QtWidgets.QLineEdit(horas_extra)
+        
+        form.addRow("Hora de entrada (HH:MM):", entrada_edit)
+        form.addRow("Hora de salida (HH:MM):", salida_edit)
+        form.addRow("Horas extra (HH:MM):", extra_edit)
+        
+        # Separador
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.HLine)
+        line.setFrameShadow(QtWidgets.QFrame.Sunken)
+        
+        # Etiqueta para turnos rápidos
+        turnos_label = QtWidgets.QLabel("Turnos rápidos:")
+        font = QtGui.QFont()
+        font.setBold(True)
+        turnos_label.setFont(font)
+        
+        # Botones de turnos predefinidos
+        turnos_layout = QtWidgets.QGridLayout()
+        
+        turnos = [
+            ("Jornada Completa", "09:00", "18:00"),
+            ("Mañana", "08:00", "16:00"),
+            ("Tarde", "16:00", "00:00"),
+            ("Noche", "00:00", "08:00"),
+            ("Media Jornada (M)", "08:00", "12:00"),
+            ("Media Jornada (T)", "14:00", "18:00"),
+            ("1 Hora", "09:00", "10:00"),
+            ("4 Horas", "09:00", "13:00"),
+            ("6 Horas", "09:00", "15:00")
+        ]
+        
+        def set_turno(inicio, fin):
+            entrada_edit.setText(inicio)
+            salida_edit.setText(fin)
+            actualizar_duracion()
+        
+        row, col = 0, 0
+        for nombre, inicio, fin in turnos:
+            btn = QtWidgets.QPushButton(nombre)
+            btn.clicked.connect(lambda _, i=inicio, f=fin: set_turno(i, f))
+            turnos_layout.addWidget(btn, row, col)
+            
+            col += 1
+            if col > 2:  # 3 botones por fila
+                col = 0
+                row += 1
+        
+        # Etiqueta para mostrar duración
+        duracion_label = QtWidgets.QLabel("Duración: --")
+        
+        def actualizar_duracion():
+            try:
+                if not entrada_edit.text() or not salida_edit.text():
+                    duracion_label.setText("Duración: --")
+                    return
+                    
+                h_entrada, m_entrada = map(int, entrada_edit.text().split(':'))
+                h_salida, m_salida = map(int, salida_edit.text().split(':'))
+                
+                # Convertir a minutos
+                minutos_entrada = h_entrada * 60 + m_entrada
+                minutos_salida = h_salida * 60 + m_salida
+                
+                # Si la salida es antes que la entrada, es al día siguiente
+                if minutos_salida < minutos_entrada:
+                    minutos_salida += 24 * 60
+                
+                # Calcular duración
+                duracion_minutos = minutos_salida - minutos_entrada
+                duracion_horas = duracion_minutos // 60
+                duracion_minutos_restantes = duracion_minutos % 60
+                
+                duracion_text = f"Duración: {duracion_horas}h {duracion_minutos_restantes}m"
+                
+                # Calcular nueva hora de salida con extras si hay
+                if extra_edit.text():
+                    h_extra, m_extra = map(int, extra_edit.text().split(':'))
+                    minutos_extra = h_extra * 60 + m_extra
+                    
+                    total_horas = (duracion_minutos + minutos_extra) // 60
+                    total_minutos = (duracion_minutos + minutos_extra) % 60
+                    
+                    duracion_text += f" + {h_extra}h {m_extra}m = {total_horas}h {total_minutos}m"
+                
+                duracion_label.setText(duracion_text)
+            except:
+                duracion_label.setText("Duración: --")
+        
+        # Conectar eventos para actualizar duración
+        entrada_edit.textChanged.connect(actualizar_duracion)
+        salida_edit.textChanged.connect(actualizar_duracion)
+        extra_edit.textChanged.connect(actualizar_duracion)
+        
+        # Botón para limpiar horario
+        limpiar_btn = QtWidgets.QPushButton("Limpiar Horario")
+        limpiar_btn.clicked.connect(lambda: [entrada_edit.clear(), salida_edit.clear(), extra_edit.clear()])
+        
+        # Botones de acciones
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            QtCore.Qt.Horizontal
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        
+        # Ensamblar layout
+        layout.addLayout(form)
+        layout.addWidget(line)
+        layout.addWidget(turnos_label)
+        layout.addLayout(turnos_layout)
+        layout.addWidget(duracion_label)
+        layout.addWidget(limpiar_btn)
+        layout.addWidget(buttons)
+        
+        dialog.setLayout(layout)
+        
+        # Ejecutar diálogo
+        if dialog.exec_() == QtWidgets.QDialog.Accepted:
+            entrada = entrada_edit.text()
+            salida = salida_edit.text()
+            extra = extra_edit.text()
+            
+            # Si los campos están vacíos, limpiar el horario
+            if not entrada and not salida:
+                self.horario_table.setItem(index.row(), index.column(), QtWidgets.QTableWidgetItem(""))
+                return
+            
+            # Validar formato de hora
+            if not self.validar_formato_hora(entrada) or not self.validar_formato_hora(salida):
+                QtWidgets.QMessageBox.warning(self, "Error", "Formato de hora incorrecto. Use HH:MM")
+                return
+            
+            # Si hay horas extra, validar formato
+            if extra and not self.validar_formato_hora(extra):
+                QtWidgets.QMessageBox.warning(self, "Error", "Formato de hora extra incorrecto. Use HH:MM")
+                return
+            
+            # Crear texto para mostrar en la tabla
+            texto = f"{entrada}-{salida}"
+            if extra:
+                # Calcular nueva hora de salida con horas extra
+                h_salida, m_salida = map(int, salida.split(':'))
+                h_extra, m_extra = map(int, extra.split(':'))
+                
+                # Convertir a minutos totales
+                minutos_salida = h_salida * 60 + m_salida
+                minutos_extra = h_extra * 60 + m_extra
+                
+                # Sumar para obtener la nueva salida
+                nueva_salida_minutos = minutos_salida + minutos_extra
+                
+                # Convertir de vuelta a horas y minutos
+                nueva_h = (nueva_salida_minutos // 60) % 24
+                nueva_m = nueva_salida_minutos % 60
+                
+                nueva_salida = f"{nueva_h:02d}:{nueva_m:02d}"
+                texto += f" +{extra}={nueva_salida}"
+            
+            # Actualizar la celda
+            self.horario_table.setItem(index.row(), index.column(), QtWidgets.QTableWidgetItem(texto))
+    
+    def validar_formato_hora(self, hora):
+        """Validar que el formato de hora sea HH:MM"""
+        try:
+            h, m = map(int, hora.split(':'))
+            return 0 <= h < 24 and 0 <= m < 60
+        except:
+            return False
+    
+    def asignar_horarios_automaticos(self):
+        """Asignar horarios automáticamente considerando los días de descanso"""
+        # Verificar si hay trabajadores
+        if not self.trabajadores:
+            QtWidgets.QMessageBox.warning(self, "Error", "No hay trabajadores para asignar horarios")
+            return
+        
+        # Verificar si se ha generado el horario
+        if self.horario_table.rowCount() == 0:
+            QtWidgets.QMessageBox.warning(self, "Error", "Primero debe generar el horario")
+            return
+        
+        # Preguntar al usuario si está seguro
+        reply = QtWidgets.QMessageBox.question(
+            self, 
+            "Confirmar asignación", 
+            "Se asignarán horarios automáticamente considerando los días de descanso de cada trabajador.\n\n"
+            "¿Desea continuar?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        
+        if reply != QtWidgets.QMessageBox.Yes:
+            return
+        
+        # Verificar si hay suficientes trabajadores
+        trabajadores_disponibles = len(self.trabajadores)
+        if trabajadores_disponibles < 3:
+            reply = QtWidgets.QMessageBox.question(
+                self, 
+                "Advertencia", 
+                "Se recomienda tener al menos 3 trabajadores para cubrir las 24 horas.\n\n"
+                "¿Desea continuar con los trabajadores disponibles?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No
+            )
+            
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+        
+        # Definir los turnos principales
+        turnos = [
+            ("08:00", "16:00"),  # Mañana
+            ("16:00", "00:00"),  # Tarde
+            ("00:00", "08:00")   # Noche
+        ]
+        
+        # Obtener el rango de fechas
+        fecha_inicio, fecha_fin = self.obtener_rango_fechas()
+        if not fecha_inicio or not fecha_fin:
+            QtWidgets.QMessageBox.warning(self, "Error", "No se pudo determinar el rango de fechas")
+            return
+        
+        # Lista de fechas en el rango
+        fechas = []
+        fecha_actual = fecha_inicio
+        while fecha_actual <= fecha_fin:
+            fechas.append(fecha_actual)
+            fecha_actual += datetime.timedelta(days=1)
+        
+        # Obtener trabajadores disponibles para cada día
+        trabajadores_por_dia = {}
+        for fecha in fechas:
+            dia_semana = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"][fecha.weekday()]
+            disponibles = [t for t in self.trabajadores if dia_semana not in self.dias_descanso.get(t, [])]
+            trabajadores_por_dia[fecha] = disponibles
+        
+        # Asignar turnos a los trabajadores
+        for fecha_idx, fecha in enumerate(fechas):
+            # Determinar si es fin de semana
+            es_fin_semana = fecha.weekday() >= 5
+            
+            # Trabajadores disponibles para este día
+            disponibles = trabajadores_por_dia[fecha]
+            if not disponibles:
+                continue
+                
+            # Calcular la semana del mes (para rotación)
+            semana = (fecha.day - 1) // 7
+            
+            # Determinar cuántos turnos asignar
+            num_turnos = min(len(disponibles), 3)  # Máximo 3 turnos
+            
+            # Asignar trabajadores a los turnos
+            for turno_idx in range(num_turnos):
+                # Obtener el turno
+                entrada, salida = turnos[turno_idx]
+                
+                # Calcular qué trabajador toma este turno (rotando cada semana)
+                trabajador_idx = (turno_idx + semana) % len(disponibles)
+                trabajador = disponibles[trabajador_idx]
+                
+                # Actualizar la tabla de horarios
+                for row in range(self.horario_table.rowCount()):
+                    if self.horario_table.item(row, 0).text() == trabajador:
+                        columna = fecha_idx + 1  # +1 porque la primera columna es el nombre
+                        
+                        # Verificar que no sea un día de descanso
+                        celda_actual = self.horario_table.item(row, columna)
+                        if celda_actual and celda_actual.text() != "DESCANSO":
+                            self.horario_table.setItem(row, columna, QtWidgets.QTableWidgetItem(f"{entrada}-{salida}"))
+        
+        QtWidgets.QMessageBox.information(self, "Éxito", "Horarios asignados automáticamente")
+    
+    def limpiar_horario(self):
+        """Limpiar el horario generado"""
+        if self.horario_table.rowCount() == 0:
+            return
+            
+        reply = QtWidgets.QMessageBox.question(
+            self, 
+            "Confirmar limpieza", 
+            "¿Está seguro de limpiar todo el horario?\n\nSe mantendrán los días de descanso.",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No
+        )
+        
+        if reply == QtWidgets.QMessageBox.Yes:
+            # Preservar los días de descanso, limpiar el resto
+            for row in range(self.horario_table.rowCount()):
+                for col in range(1, self.horario_table.columnCount()):
+                    item = self.horario_table.item(row, col)
+                    if item and item.text() != "DESCANSO":
+                        self.horario_table.setItem(row, col, QtWidgets.QTableWidgetItem(""))
+                        
+            QtWidgets.QMessageBox.information(self, "Éxito", "Horario limpiado exitosamente")
+    
+    def calcular_resumen(self):
+        """Calcular el resumen de horas trabajadas"""
+        # Verificar si hay horarios generados
+        if self.horario_table.rowCount() == 0:
+            QtWidgets.QMessageBox.warning(self, "Error", "No hay horarios para calcular resumen")
+            return
+        
+        # Limpiar tabla de resumen
+        self.resumen_table.setRowCount(0)
+        
+        # Calcular resumen para cada trabajador
+        for row in range(self.horario_table.rowCount()):
+            trabajador = self.horario_table.item(row, 0).text()
+            
+            horas_regulares = 0.0
+            horas_extra = 0.0
+            dias_laborados = 0
+            
+            # Recorrer los días
+            for col in range(1, self.horario_table.columnCount()):
+                item = self.horario_table.item(row, col)
+                if item and item.text() and item.text() != "DESCANSO":
+                    dias_laborados += 1
+                    horario = item.text()
+                    
+                    try:
+                        # Puede tener formato: "HH:MM-HH:MM" o "HH:MM-HH:MM +HH:MM=HH:MM"
+                        partes = horario.split(" ")
+                        horas_base = partes[0].split("-")
+                        
+                        if len(horas_base) == 2:
+                            h_entrada, m_entrada = map(int, horas_base[0].split(':'))
+                            h_salida, m_salida = map(int, horas_base[1].split(':'))
+                            
+                            # Convertir a minutos
+                            minutos_entrada = h_entrada * 60 + m_entrada
+                            minutos_salida = h_salida * 60 + m_salida
+                            
+                            # Si la salida es antes que la entrada, es al día siguiente
+                            if minutos_salida < minutos_entrada:
+                                minutos_salida += 24 * 60
+                            
+                            # Calcular horas regulares
+                            horas_regulares += (minutos_salida - minutos_entrada) / 60
+                            
+                            # Calcular horas extra
+                            if len(partes) > 1 and partes[1].startswith("+"):
+                                extra = partes[1][1:].split("=")[0]
+                                h_extra, m_extra = map(int, extra.split(':'))
+                                horas_extra += h_extra + m_extra / 60
+                    except Exception as e:
+                        print(f"Error al procesar horario '{horario}': {e}")
+            
+            # Agregar a la tabla de resumen
+            row_position = self.resumen_table.rowCount()
+            self.resumen_table.insertRow(row_position)
+            self.resumen_table.setItem(row_position, 0, QtWidgets.QTableWidgetItem(trabajador))
+            self.resumen_table.setItem(row_position, 1, QtWidgets.QTableWidgetItem(f"{horas_regulares:.2f}"))
+            self.resumen_table.setItem(row_position, 2, QtWidgets.QTableWidgetItem(f"{horas_extra:.2f}"))
+            self.resumen_table.setItem(row_position, 3, QtWidgets.QTableWidgetItem(f"{(horas_regulares + horas_extra):.2f}"))
+            self.resumen_table.setItem(row_position, 4, QtWidgets.QTableWidgetItem(str(dias_laborados)))
+        
+        # Ajustar tamaño de columnas
+        self.resumen_table.resizeColumnsToContents()
+        
+        QtWidgets.QMessageBox.information(self, "Éxito", "Resumen calculado correctamente")
+    
+    def exportar_horario_pdf(self):
+        """Exportar el horario a un archivo PDF"""
+        # Verificar si hay datos para exportar
+        if self.horario_table.rowCount() == 0:
+            QtWidgets.QMessageBox.warning(self, "Error", "No hay horarios para exportar")
+            return
+        
+        # Solicitar ubicación para guardar
+        opciones = QtWidgets.QFileDialog.Options()
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Guardar Horario como PDF", "", "Archivos PDF (*.pdf)", options=opciones
+        )
+        
+        if not file_path:
+            return
+        
+        # Obtener el rango de fechas
+        fecha_inicio, fecha_fin = self.obtener_rango_fechas()
+        
+        # Crear el documento PDF en formato apaisado
+        doc = SimpleDocTemplate(file_path, pagesize=landscape(letter))
+        elementos = []
+        
+        # Estilos
+        estilos = getSampleStyleSheet()
+        
+        # Título
+        titulo_texto = "Horario Laboral"
+        if fecha_inicio and fecha_fin:
+            titulo_texto += f" - {fecha_inicio.strftime('%d/%m/%Y')} al {fecha_fin.strftime('%d/%m/%Y')}"
+        elementos.append(Paragraph(titulo_texto, estilos['Title']))
+        
+        # Espacio
+        elementos.append(Paragraph("<br/>", estilos['Normal']))
+        
+        # Obtener datos de la tabla
+        datos = []
+        encabezados = []
+        
+        # Encabezados
+        for col in range(self.horario_table.columnCount()):
+            encabezados.append(self.horario_table.horizontalHeaderItem(col).text())
+        
+        datos.append(encabezados)
+        
+        # Datos de cada fila
+        for row in range(self.horario_table.rowCount()):
+            fila = []
+            for col in range(self.horario_table.columnCount()):
+                item = self.horario_table.item(row, col)
+                fila.append(item.text() if item else "")
+            datos.append(fila)
+        
+        # Crear tabla
+        tabla = Table(datos, repeatRows=1)
+        
+        # Estilo de la tabla
+        estilo = TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black)
+        ])
+        
+        # Colorear fines de semana y días de descanso
+        for col, encabezado in enumerate(encabezados):
+            if col > 0:  # Ignorar columna de trabajador
+                if "Sáb" in encabezado:
+                    estilo.add('BACKGROUND', (col, 1), (col, -1), colors.lightblue)
+                elif "Dom" in encabezado:
+                    estilo.add('BACKGROUND', (col, 1), (col, -1), colors.lightcoral)
+        
+        for row in range(1, len(datos)):
+            for col in range(1, len(encabezados)):
+                if datos[row][col] == "DESCANSO":
+                    estilo.add('BACKGROUND', (col, row), (col, row), colors.lightyellow)
+        
+        tabla.setStyle(estilo)
+        elementos.append(tabla)
+        
+        # Agregar resumen si hay datos
+        if self.resumen_table.rowCount() > 0:
+            # Espacio
+            elementos.append(Paragraph("<br/><br/>", estilos['Normal']))
+            
+            # Título de la sección de resumen
+            elementos.append(Paragraph("Resumen de Horas Trabajadas", estilos['Heading1']))
+            
+            # Datos del resumen
+            datos_resumen = []
+            encabezados_resumen = []
+            
+            # Encabezados
+            for col in range(self.resumen_table.columnCount()):
+                encabezados_resumen.append(self.resumen_table.horizontalHeaderItem(col).text())
+            
+            datos_resumen.append(encabezados_resumen)
+            
+            # Datos
+            for row in range(self.resumen_table.rowCount()):
+                fila = []
+                for col in range(self.resumen_table.columnCount()):
+                    item = self.resumen_table.item(row, col)
+                    fila.append(item.text() if item else "")
+                datos_resumen.append(fila)
+            
+            # Crear tabla de resumen
+            tabla_resumen = Table(datos_resumen, repeatRows=1)
+            
+            # Estilo de la tabla de resumen
+            estilo_resumen = TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black)
+            ])
+            
+            tabla_resumen.setStyle(estilo_resumen)
+            elementos.append(tabla_resumen)
+        
+        # Construir el PDF
+        doc.build(elementos)
+        
+        QtWidgets.QMessageBox.information(self, "Éxito", f"Horario exportado a {file_path}")
+    
+    def exportar_horario_excel(self):
+        """Exportar el horario a un archivo Excel"""
+        # Verificar si hay datos para exportar
+        if self.horario_table.rowCount() == 0:
+            QtWidgets.QMessageBox.warning(self, "Error", "No hay horarios para exportar")
+            return
+        
+        # Solicitar ubicación para guardar
+        opciones = QtWidgets.QFileDialog.Options()
+        file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Guardar Horario como Excel", "", "Archivos Excel (*.xlsx)", options=opciones
+        )
+        
+        if not file_path:
+            return
+        
+        try:
+            # Obtener datos del horario
+            encabezados = []
+            for col in range(self.horario_table.columnCount()):
+                encabezados.append(self.horario_table.horizontalHeaderItem(col).text())
+            
+            datos_horario = []
+            for row in range(self.horario_table.rowCount()):
+                fila = []
+                for col in range(self.horario_table.columnCount()):
+                    item = self.horario_table.item(row, col)
+                    fila.append(item.text() if item else "")
+                datos_horario.append(fila)
+            
+            # Crear DataFrame para el horario
+            df_horario = pd.DataFrame(datos_horario, columns=encabezados)
+            
+            # Obtener datos del resumen si existen
+            if self.resumen_table.rowCount() > 0:
+                encabezados_resumen = []
+                for col in range(self.resumen_table.columnCount()):
+                    encabezados_resumen.append(self.resumen_table.horizontalHeaderItem(col).text())
+                
+                datos_resumen = []
+                for row in range(self.resumen_table.rowCount()):
+                    fila = []
+                    for col in range(self.resumen_table.columnCount()):
+                        item = self.resumen_table.item(row, col)
+                        fila.append(item.text() if item else "")
+                    datos_resumen.append(fila)
+                
+                # Crear DataFrame para el resumen
+                df_resumen = pd.DataFrame(datos_resumen, columns=encabezados_resumen)
+            else:
+                df_resumen = None
+            
+            # Exportar a Excel
+            with pd.ExcelWriter(file_path, engine='openpyxl') as writer:
+                df_horario.to_excel(writer, sheet_name='Horario', index=False)
+                
+                if df_resumen is not None:
+                    df_resumen.to_excel(writer, sheet_name='Resumen', index=False)
+            
+            QtWidgets.QMessageBox.information(self, "Éxito", f"Horario exportado a {file_path}")
+            
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Error", f"Error al exportar a Excel: {str(e)}")
+            print(f"Error en exportar_horario_excel: {e}")
+    # ==== FIN DEL SISTEMA DE HORARIOS LABORALES ====
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    window = HoteleroApp()
+    window.show()
+    sys.exit(app.exec_())
